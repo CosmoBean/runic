@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Runic</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+  <style>
+    :root {
+      --bg: #1a1a2e;
+      --panel: #232343;
+      --fg: #f0f0f5;
+      --muted: #a9abc5;
+      --ok: #2ed573;
+      --bad: #ff4757;
+      --accent: #4dc4ff;
+      --btn: #30305a;
+      --btn-active: #3f3f76;
+      --border: #3a3a68;
+      --topbar-h: 56px;
+      --keys-h: 56px;
+    }
+
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow: hidden;
+    }
+
+    #app {
+      width: 100%;
+      height: 100%;
+      display: grid;
+      grid-template-rows: var(--topbar-h) 1fr auto;
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      align-items: center;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(180deg, #2a2a4f, #20203a);
+    }
+
+    .conn-form {
+      display: grid;
+      grid-template-columns: minmax(110px, 1fr) minmax(130px, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      min-width: 0;
+    }
+
+    input, button {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--fg);
+      min-height: 40px;
+      padding: 8px 10px;
+      font: inherit;
+    }
+
+    button {
+      background: var(--btn);
+      cursor: pointer;
+      min-width: 92px;
+    }
+
+    button:hover { background: var(--btn-active); }
+    button:disabled {
+      opacity: 0.65;
+      cursor: default;
+    }
+
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--muted);
+      white-space: nowrap;
+      justify-self: end;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--bad);
+      box-shadow: 0 0 10px rgba(255, 71, 87, 0.4);
+    }
+
+    .dot.ok {
+      background: var(--ok);
+      box-shadow: 0 0 10px rgba(46, 213, 115, 0.45);
+    }
+
+    #terminal-wrap {
+      position: relative;
+      min-height: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    #terminal {
+      width: 100%;
+      height: 100%;
+      padding: 10px;
+    }
+
+    #session-picker {
+      position: absolute;
+      inset: 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: rgba(14, 14, 31, 0.94);
+      padding: 12px;
+      overflow: auto;
+      display: none;
+      z-index: 6;
+    }
+
+    #session-picker h3 {
+      margin: 0 0 10px;
+      font-size: 15px;
+    }
+
+    .session-list {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .session-btn {
+      text-align: left;
+      min-height: 44px;
+      width: 100%;
+    }
+
+    #extra-keys {
+      display: none;
+      gap: 8px;
+      padding: 8px;
+      border-top: 1px solid var(--border);
+      background: #15152b;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    .key-btn {
+      min-width: 48px;
+      min-height: 44px;
+      flex: 0 0 auto;
+      font-size: 13px;
+      background: #2a2a4f;
+    }
+
+    @media (max-width: 760px) {
+      .topbar {
+        grid-template-columns: 1fr;
+      }
+      .status {
+        justify-self: start;
+      }
+      .conn-form {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div class="topbar">
+      <form class="conn-form" id="conn-form">
+        <input id="host" type="text" placeholder="host:port" autocomplete="off">
+        <input id="token" type="password" placeholder="token" autocomplete="off">
+        <button id="connect" type="submit">Connect</button>
+      </form>
+      <div class="status"><span id="dot" class="dot"></span><span id="status-text">Disconnected</span></div>
+    </div>
+
+    <div id="terminal-wrap">
+      <div id="terminal"></div>
+      <div id="session-picker">
+        <h3>Sessions</h3>
+        <div id="sessions" class="session-list"></div>
+        <button id="new-session" type="button">Create New Session</button>
+      </div>
+    </div>
+
+    <div id="extra-keys"></div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
+  <script>
+    const hostInput = document.getElementById('host');
+    const tokenInput = document.getElementById('token');
+    const form = document.getElementById('conn-form');
+    const connectBtn = document.getElementById('connect');
+    const dot = document.getElementById('dot');
+    const statusText = document.getElementById('status-text');
+    const picker = document.getElementById('session-picker');
+    const sessionsEl = document.getElementById('sessions');
+    const newSessionBtn = document.getElementById('new-session');
+    const extraKeys = document.getElementById('extra-keys');
+
+    hostInput.value = location.host || 'localhost:8765';
+
+    const term = new Terminal({
+      cursorBlink: true,
+      fontSize: 14,
+      theme: {
+        background: '#101023',
+        foreground: '#f0f0f5',
+        cursor: '#4dc4ff'
+      },
+      scrollback: 2500,
+      convertEol: false
+    });
+    const fitAddon = new FitAddon.FitAddon();
+    const webLinks = new WebLinksAddon.WebLinksAddon();
+    term.loadAddon(fitAddon);
+    term.loadAddon(webLinks);
+    term.open(document.getElementById('terminal'));
+
+    let ws;
+    let authed = false;
+    let attached = false;
+    let reconnectDelay = 1000;
+    let reconnectTimer = null;
+    let lastCreds = null;
+
+    function setStatus(isConnected, text) {
+      dot.classList.toggle('ok', isConnected);
+      statusText.textContent = text;
+      connectBtn.textContent = isConnected ? 'Disconnect' : 'Connect';
+    }
+
+    function wsURL(inputHost) {
+      if (inputHost.startsWith('ws://') || inputHost.startsWith('wss://')) {
+        return inputHost.endsWith('/ws') ? inputHost : inputHost.replace(/\/$/, '') + '/ws';
+      }
+      const proto = location.protocol === 'http:' ? 'ws' : 'wss';
+      return `${proto}://${inputHost.replace(/\/$/, '')}/ws`;
+    }
+
+    function sendJSON(type, data) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({ type, data }));
+    }
+
+    function sendInput(data) {
+      if (!ws || ws.readyState !== WebSocket.OPEN || !attached) return;
+      const payload = new Uint8Array(1 + data.length);
+      payload[0] = 0x02;
+      payload.set(data, 1);
+      ws.send(payload);
+    }
+
+    function sendResize() {
+      if (!ws || ws.readyState !== WebSocket.OPEN || !attached) return;
+      fitAddon.fit();
+      const cols = term.cols || 80;
+      const rows = term.rows || 24;
+      const payload = new Uint8Array([0x03, (cols >> 8) & 0xff, cols & 0xff, (rows >> 8) & 0xff, rows & 0xff]);
+      ws.send(payload);
+    }
+
+    function detachState(message) {
+      attached = false;
+      picker.style.display = 'none';
+      if (message) {
+        term.writeln(`\r\n[${message}]`);
+      }
+    }
+
+    function showSessions(sessions) {
+      sessionsEl.innerHTML = '';
+      if (!Array.isArray(sessions) || sessions.length === 0) {
+        sendJSON('create', {});
+        return;
+      }
+      picker.style.display = 'block';
+      sessions.forEach((s) => {
+        const btn = document.createElement('button');
+        btn.className = 'session-btn';
+        btn.type = 'button';
+        btn.textContent = `${s.name || s.id} (${s.running ? 'running' : 'stopped'})`;
+        btn.onclick = () => {
+          picker.style.display = 'none';
+          sendJSON('attach', { session_id: s.id });
+        };
+        sessionsEl.appendChild(btn);
+      });
+    }
+
+    function onControlMessage(msg) {
+      const type = msg.type;
+      const data = msg.data || {};
+      if (type === 'auth_ok') {
+        authed = true;
+        reconnectDelay = 1000;
+        setStatus(true, `Connected: ${data.machine_name || 'machine'}`);
+        sendJSON('list_sessions', {});
+        return;
+      }
+      if (type === 'session_list') {
+        showSessions(data.sessions || []);
+        return;
+      }
+      if (type === 'attached') {
+        attached = true;
+        picker.style.display = 'none';
+        term.focus();
+        fitAddon.fit();
+        sendResize();
+        term.writeln(`\r\n[Attached to ${data.session_id}]`);
+        return;
+      }
+      if (type === 'detached') {
+        detachState(data.reason ? `Detached: ${data.reason}` : 'Detached');
+        sendJSON('list_sessions', {});
+        return;
+      }
+      if (type === 'error') {
+        term.writeln(`\r\n[Error ${data.code || ''}: ${data.message || 'unknown'}]`);
+        if ((data.code || '').startsWith('AUTH')) {
+          closeSocket(false);
+        }
+        return;
+      }
+      if (type === 'pong') return;
+    }
+
+    function closeSocket(reconnect) {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (ws) {
+        const keep = ws;
+        ws = null;
+        keep.onclose = null;
+        keep.onerror = null;
+        keep.onmessage = null;
+        keep.close();
+      }
+      authed = false;
+      detachState();
+      setStatus(false, 'Disconnected');
+      if (reconnect && lastCreds) {
+        reconnectTimer = setTimeout(() => {
+          connect(lastCreds.host, lastCreds.token, true);
+        }, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+        setStatus(false, `Reconnecting in ${Math.round(reconnectDelay / 1000)}s`);
+      }
+    }
+
+    function connect(host, token, isRetry) {
+      if (!host || !token) return;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        closeSocket(false);
+        return;
+      }
+      lastCreds = { host, token };
+      setStatus(false, isRetry ? 'Reconnecting...' : 'Connecting...');
+      picker.style.display = 'none';
+
+      ws = new WebSocket(wsURL(host));
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        setStatus(false, 'Authenticating...');
+        ws.send(JSON.stringify({ type: 'auth', data: { token, client_id: navigator.userAgent } }));
+      };
+
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === 'string') {
+          let msg;
+          try {
+            msg = JSON.parse(ev.data);
+          } catch {
+            return;
+          }
+          onControlMessage(msg);
+          return;
+        }
+        if (ev.data instanceof ArrayBuffer) {
+          const raw = new Uint8Array(ev.data);
+          if (raw.length < 2) return;
+          if (raw[0] === 0x01) {
+            term.write(new TextDecoder().decode(raw.slice(1)));
+          }
+        }
+      };
+
+      ws.onerror = () => {
+        setStatus(false, 'Connection error');
+      };
+
+      ws.onclose = () => {
+        closeSocket(true);
+      };
+    }
+
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        closeSocket(false);
+        return;
+      }
+      connect(hostInput.value.trim(), tokenInput.value, false);
+    });
+
+    newSessionBtn.addEventListener('click', () => {
+      picker.style.display = 'none';
+      sendJSON('create', {});
+    });
+
+    term.onData((data) => {
+      const bytes = new TextEncoder().encode(data);
+      sendInput(bytes);
+    });
+
+    window.addEventListener('resize', () => {
+      sendResize();
+    });
+
+    function isTouchDevice() {
+      return ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+    }
+
+    function sendEscaped(text) {
+      sendInput(new TextEncoder().encode(text));
+      term.focus();
+    }
+
+    function buildExtraKeys() {
+      if (!isTouchDevice()) return;
+      extraKeys.style.display = 'flex';
+      const keys = [
+        { label: 'Esc', value: '\u001b' },
+        { label: 'Tab', value: '\t' },
+        { label: 'Ctrl+C', value: '\u0003' },
+        { label: 'Ctrl+D', value: '\u0004' },
+        { label: 'Alt', value: '\u001b' },
+        { label: '↑', value: '\u001b[A' },
+        { label: '↓', value: '\u001b[B' },
+        { label: '←', value: '\u001b[D' },
+        { label: '→', value: '\u001b[C' }
+      ];
+      keys.forEach((k) => {
+        const btn = document.createElement('button');
+        btn.className = 'key-btn';
+        btn.type = 'button';
+        btn.textContent = k.label;
+        btn.addEventListener('click', () => sendEscaped(k.value));
+        extraKeys.appendChild(btn);
+      });
+    }
+
+    buildExtraKeys();
+    fitAddon.fit();
+    setStatus(false, 'Disconnected');
+    term.writeln('Runic web client ready. Enter host and token to connect.');
+  </script>
+</body>
+</html>
