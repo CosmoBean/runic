@@ -9,8 +9,11 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -24,22 +27,24 @@ import (
 //go:embed all:web
 var webFS embed.FS
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  16384,
-	WriteBufferSize: 16384,
-	CheckOrigin:     func(r *http.Request) bool { return true }, // Allow all origins for self-hosted
+type Server struct {
+	cfg             *config.Config
+	auth            *auth.Authenticator
+	mgr             *session.Manager
+	httpSrv         *http.Server
+	upgrader        websocket.Upgrader
+	allowedOrigins  map[string]struct{}
+	trustedProxyNet []*net.IPNet
 }
 
-type Server struct {
-	cfg     *config.Config
-	auth    *auth.Authenticator
-	mgr     *session.Manager
-	httpSrv *http.Server
-}
+var wsConnID atomic.Uint64
 
 func New(cfg *config.Config) *Server {
 	mgr := session.NewManager(session.ManagerOpts{
 		DefaultShell: cfg.Sessions.DefaultShell,
+		SessionMode:  cfg.Sessions.SessionMode,
+		LoginShell:   cfg.Sessions.LoginShell,
+		StartDir:     cfg.Sessions.StartDir,
 		MaxSessions:  cfg.Sessions.MaxSessions,
 		BufSize:      cfg.Sessions.PtyBufferSize,
 		ChanSize:     cfg.Sessions.WsWriteBuffer,
@@ -52,11 +57,29 @@ func New(cfg *config.Config) *Server {
 		cfg.Auth.LockoutMin,
 	)
 
-	return &Server{
-		cfg:  cfg,
-		auth: authenticator,
-		mgr:  mgr,
+	srv := &Server{
+		cfg:            cfg,
+		auth:           authenticator,
+		mgr:            mgr,
+		allowedOrigins: make(map[string]struct{}),
 	}
+	srv.upgrader = websocket.Upgrader{
+		ReadBufferSize:  16384,
+		WriteBufferSize: 16384,
+		CheckOrigin:     srv.checkOrigin,
+	}
+	for _, raw := range cfg.Security.AllowedOrigins {
+		if strings.TrimSpace(raw) == "*" {
+			srv.allowedOrigins["*"] = struct{}{}
+			continue
+		}
+		if norm, ok := normalizeOrigin(raw); ok {
+			srv.allowedOrigins[norm] = struct{}{}
+		}
+	}
+	srv.trustedProxyNet = parseCIDRs(cfg.Security.TrustedProxyCIDRs)
+
+	return srv
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -103,13 +126,23 @@ func (s *Server) Start(ctx context.Context) error {
 		log.Printf("Runic listening on http://%s (WARNING: no TLS)", addr)
 	}
 	log.Printf("Machine name: %s", s.cfg.Machine.Name)
+	if len(s.allowedOrigins) == 0 {
+		log.Printf("Security warning: security.allowed_origins is empty; WebSocket origin checks are permissive")
+	} else {
+		origins := make([]string, 0, len(s.allowedOrigins))
+		for origin := range s.allowedOrigins {
+			origins = append(origins, origin)
+		}
+		sort.Strings(origins)
+		log.Printf("WebSocket allowed origins: %s", strings.Join(origins, ", "))
+	}
 
 	// Graceful shutdown
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		s.mgr.KillAll()
+		s.mgr.ShutdownAll()
 		_ = s.httpSrv.Shutdown(shutdownCtx)
 	}()
 
@@ -146,12 +179,15 @@ func (s *Server) loadTLS() (*tls.Config, error) {
 
 // handleWebSocket manages the lifecycle of a single client connection.
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+	connID := wsConnID.Add(1)
+	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("Upgrade error: %v", err)
+		log.Printf("ws_upgrade_failed conn=%d remote=%q origin=%q err=%v", connID, r.RemoteAddr, r.Header.Get("Origin"), err)
 		return
 	}
 	defer conn.Close()
+	log.Printf("ws_connected conn=%d remote=%q origin=%q", connID, r.RemoteAddr, r.Header.Get("Origin"))
+	defer log.Printf("ws_disconnected conn=%d", connID)
 
 	// Set TCP_NODELAY for low latency
 	if tcpConn, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
@@ -162,10 +198,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	clientIP := r.RemoteAddr
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		clientIP = strings.Split(fwd, ",")[0]
-	}
+	clientIP := s.clientIP(r)
 
 	// Step 1: Authenticate
 	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -178,19 +211,25 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	msg, err := protocol.Decode(raw)
 	if err != nil || msg.Type != protocol.TypeAuth {
 		sendError(conn, "AUTH_REQUIRED", "First message must be auth")
+		log.Printf("auth_failed conn=%d ip=%q code=AUTH_REQUIRED reason=%q", connID, clientIP, "first message must be auth")
 		return
 	}
 
 	authReq, err := protocol.DecodeData[protocol.AuthRequest](msg)
 	if err != nil {
 		sendError(conn, "AUTH_INVALID", "Invalid auth message")
+		log.Printf("auth_failed conn=%d ip=%q code=AUTH_INVALID reason=%q", connID, clientIP, "invalid auth message")
 		return
 	}
 
-	if err := s.auth.Verify(authReq.Token, clientIP); err != nil {
-		sendError(conn, "AUTH_FAILED", err.Error())
-		return
+	if s.cfg.Auth.RequireToken {
+		if err := s.auth.Verify(authReq.Token, clientIP); err != nil {
+			sendError(conn, "AUTH_FAILED", err.Error())
+			log.Printf("auth_failed conn=%d ip=%q code=AUTH_FAILED reason=%q", connID, clientIP, err.Error())
+			return
+		}
 	}
+	log.Printf("auth_ok conn=%d ip=%q client_id=%q", connID, clientIP, authReq.ClientID)
 
 	// Auth succeeded
 	okData, _ := protocol.Encode(protocol.TypeAuthOK, protocol.AuthOKResponse{
@@ -339,11 +378,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 // streamOutput reads from a session's output channel and sends to the WebSocket.
 func streamOutput(ctx context.Context, sess *session.Session, send func(int, []byte) error) {
+	subID, out := sess.SubscribeOutput()
+	defer sess.UnsubscribeOutput(subID)
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case data, ok := <-sess.Output():
+		case data, ok := <-out:
 			if !ok {
 				// Session ended
 				resp, _ := protocol.Encode(protocol.TypeDetached, map[string]string{"reason": "exited"})
@@ -361,4 +403,75 @@ func streamOutput(ctx context.Context, sess *session.Session, send func(int, []b
 func sendError(conn *websocket.Conn, code, message string) {
 	data, _ := protocol.Encode(protocol.TypeError, protocol.ErrorResponse{Code: code, Message: message})
 	_ = conn.WriteMessage(websocket.TextMessage, data)
+}
+
+func (s *Server) checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true // Non-browser clients often omit Origin.
+	}
+	if len(s.allowedOrigins) == 0 {
+		return true
+	}
+	if _, ok := s.allowedOrigins["*"]; ok {
+		return true
+	}
+	norm, ok := normalizeOrigin(origin)
+	if !ok {
+		return false
+	}
+	if _, allowed := s.allowedOrigins[norm]; allowed {
+		return true
+	}
+	return false
+}
+
+func normalizeOrigin(raw string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", false
+	}
+	return strings.ToLower(u.Scheme + "://" + u.Host), true
+}
+
+func parseCIDRs(values []string) []*net.IPNet {
+	list := make([]*net.IPNet, 0, len(values))
+	for _, raw := range values {
+		_, cidr, err := net.ParseCIDR(strings.TrimSpace(raw))
+		if err == nil && cidr != nil {
+			list = append(list, cidr)
+		}
+	}
+	return list
+}
+
+func (s *Server) clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	if !s.cfg.Security.TrustProxyHeaders || ip == nil || !s.isTrustedProxy(ip) {
+		return host
+	}
+
+	fwd := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
+	if fwd == "" {
+		return host
+	}
+	parts := strings.Split(fwd, ",")
+	candidate := strings.TrimSpace(parts[0])
+	if net.ParseIP(candidate) == nil {
+		return host
+	}
+	return candidate
+}
+
+func (s *Server) isTrustedProxy(ip net.IP) bool {
+	for _, cidr := range s.trustedProxyNet {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }

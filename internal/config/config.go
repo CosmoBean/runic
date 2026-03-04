@@ -5,15 +5,16 @@ import (
 	"os"
 	"path/filepath"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 type Config struct {
-	Machine  MachineConfig `yaml:"machine"`
-	Server   ServerConfig  `yaml:"server"`
-	Auth     AuthConfig    `yaml:"auth"`
-	TLS      TLSConfig     `yaml:"tls"`
-	Sessions SessionConfig `yaml:"sessions"`
+	Machine  MachineConfig  `yaml:"machine"`
+	Server   ServerConfig   `yaml:"server"`
+	Auth     AuthConfig     `yaml:"auth"`
+	TLS      TLSConfig      `yaml:"tls"`
+	Sessions SessionConfig  `yaml:"sessions"`
+	Security SecurityConfig `yaml:"security"`
 }
 
 type MachineConfig struct {
@@ -26,9 +27,11 @@ type ServerConfig struct {
 }
 
 type AuthConfig struct {
-	TokenHash  string `yaml:"token_hash"`
-	RateLimit  int    `yaml:"rate_limit"`
-	LockoutMin int    `yaml:"lockout_minutes"`
+	TokenHash         string `yaml:"token_hash"`
+	RequireToken      bool   `yaml:"require_token"`
+	TokenRotationDays int    `yaml:"token_rotation_days"`
+	RateLimit         int    `yaml:"rate_limit"`
+	LockoutMin        int    `yaml:"lockout_minutes"`
 }
 
 type TLSConfig struct {
@@ -38,25 +41,46 @@ type TLSConfig struct {
 }
 
 type SessionConfig struct {
+	SessionMode   string `yaml:"session_mode"` // "auto", "pty", "tmux"
 	DefaultShell  string `yaml:"default_shell"`
+	LoginShell    bool   `yaml:"login_shell"`
+	StartDir      string `yaml:"start_dir"`
 	MaxSessions   int    `yaml:"max_sessions"`
 	PtyBufferSize int    `yaml:"pty_buffer_size"`
 	WsWriteBuffer int    `yaml:"ws_write_buffer"`
 	ThrottleMB    int    `yaml:"throttle_threshold_mb"`
 }
 
+type SecurityConfig struct {
+	AllowedOrigins    []string `yaml:"allowed_origins"`
+	TrustProxyHeaders bool     `yaml:"trust_proxy_headers"`
+	TrustedProxyCIDRs []string `yaml:"trusted_proxy_cidrs"`
+}
+
 func DefaultConfig() *Config {
 	return &Config{
 		Machine: MachineConfig{Name: hostname()},
 		Server:  ServerConfig{Host: "0.0.0.0", Port: 8765},
-		Auth:    AuthConfig{RateLimit: 5, LockoutMin: 15},
-		TLS:     TLSConfig{Mode: "self-signed"},
+		Auth: AuthConfig{
+			RequireToken:      true,
+			TokenRotationDays: 30,
+			RateLimit:         5,
+			LockoutMin:        15,
+		},
+		TLS: TLSConfig{Mode: "self-signed"},
 		Sessions: SessionConfig{
+			SessionMode:   "auto",
 			DefaultShell:  defaultShell(),
+			LoginShell:    true,
+			StartDir:      defaultStartDir(),
 			MaxSessions:   20,
 			PtyBufferSize: 16384,
 			WsWriteBuffer: 64,
 			ThrottleMB:    1,
+		},
+		Security: SecurityConfig{
+			TrustProxyHeaders: false,
+			TrustedProxyCIDRs: []string{"127.0.0.1/32", "::1/128"},
 		},
 	}
 }
@@ -102,4 +126,12 @@ func defaultShell() string {
 		shell = "/bin/sh"
 	}
 	return shell
+}
+
+func defaultStartDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "/"
+	}
+	return home
 }
