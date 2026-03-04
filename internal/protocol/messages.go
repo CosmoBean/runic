@@ -72,6 +72,7 @@ type AttachedResponse struct {
 type CreateRequest struct {
 	Name  string `json:"name,omitempty"`
 	Shell string `json:"shell,omitempty"`
+	Type  string `json:"type,omitempty"` // "auto", "pty", "tmux"
 	Cols  int    `json:"cols,omitempty"`
 	Rows  int    `json:"rows,omitempty"`
 }
