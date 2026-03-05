@@ -1,1 +1,44 @@
 .context/
+
+# Binaries and build artifacts
+/runic
+/dist/
+/bin/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+*.coverprofile
+
+# Go workspace/cache files
+go.work
+go.work.sum
+
+# Node/npm artifacts
+node_modules/
+npm/node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tgz
+
+# Local config/secrets
+.env
+.env.*
+config.yaml
+*.pem
+*.key
+*.crt
+
+# Runtime files
+*.pid
+*.log
+
+# Editor/OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
